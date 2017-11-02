@@ -1,0 +1,417 @@
+############################################################################################################
+################################## Various helpers for Distributed Array tasks #############################
+
+# Prints out info on how the given darray is distributed across different processors
+function howdist(s::DArray)
+   d = procs(s)
+   dn = numel(d)
+   for k=1:dn
+      pid = d[k]
+      st = fetch(@spawnat pid myindexes(s))
+      ind = st[1]
+      println("$pid - $ind ")
+   end
+end
+
+# Returns an array of indexes of elements of darray s that are local to the current processor,
+# after data from processors (pid1+1 to pid2) have been moved to pid1
+function getLocalDistIndexes(s::DArray, pid1, pid2)
+    if (pid2 > pid1)
+        i = myid()
+
+        #If current proc is outside the range then just return its current distribution
+        if (i < pid1 || i > pid2)
+            return myindexes(s)[1]
+
+        #If current proc is the processor involved in the redistribution, i.e. pid1
+        else if (i == pid1)
+            ind2 = fetch(@spawnat pid2 myindexes(s))[1]
+            retStop = ind2[numel(ind2)]
+
+            # get the index of the first element that lives on current proc
+            retStart = myindexes(s)[1][1]
+
+            return (retStart:retStop)
+
+            end
+        end
+    end
+end
+
+# Computes and returns an array of indexes that specify blocks of contiguous data for
+# the darray after data from processors (pid1 + 1 to pid2) have been moved to pid1
+function newDistIndexes(s::DArray, pid1, pid2)
+    if (pid2 > pid1)
+        plist = procs(s)
+        sp = numel(plist)
+
+        # Find out the number of processors between pid1 and pid2 that contain data from s
+        indexOfPid1 = 0
+        indexOfPid2 = 0
+        for k = 1 : sp
+           if (plist[k] == pid1)
+              indexOfPid1 = k
+           else if (plist[k] == pid2)
+              indexOfPid2 = k
+           end
+           end
+        end
+        offset = indexOfPid2 - indexOfPid1
+
+        indexes = int32(zeros(sp + 1 - offset))
+        topIndexes = 1
+
+        for k = 1 : sp
+           if (plist[k] <= pid1 || plist[k] > pid2)
+                indexes[topIndexes] = fetch(@spawnat plist[k] myindexes(s))[1][1]
+                topIndexes = topIndexes + 1
+           end
+        end
+
+        indexes[topIndexes] = numel(s) + 1
+
+        return indexes
+    end
+end
+
+
+
+# Redistribute the darray s by moving all data from processors (pid1 + 1 to pid2) to processor pid1
+# except leaving only one element left on each of those processors
+# Returns a new darray
+function redist(s::DArray, pid1, pid2)
+   plist = procs(s)
+   np = numel(plist)
+   newplist = int64(zeros(np))
+   toplist = 1
+
+   for k = 1 : np
+      if (plist[k] <= pid1 || plist[k] > pid2)
+         newplist[toplist] = plist[k]
+         toplist = toplist + 1
+      end
+   end
+
+   return darray((T,lsz,da)->s[getLocalDistIndexes(s, pid1, pid2)], eltype(s), size(s), distdim(s), newplist[1:top\
+list-1], newDistIndexes(s, pid1, pid2))
+end
+
+# Returns an array of indexes of elements of darray s that are local to the current processor
+# given that data is specially redistributed for black box algorithm
+function redistbb_localIndexes(s::DArray, np, l)
+   numIndex = np >> 1 + 1
+   size = 2^l
+   list = zeros(Int64, numIndex)
+   for i = 1 : numIndex - 1
+      list[i] = fetch(@spawnat ((i - 1) * size + 1) myindexes(s))[1][1]
+   end
+   list[numIndex] = numel(s) + 1
+   return list
+end
+
+# l = level, 1-based number
+function redistbb_localValues(s::DArray, l)
+   p = myid()
+   subsize = 2^l
+   r = p % subsize
+   if (r == 1)
+      iStart = myindexes(s)[1][1]
+      indexesStop = fetch(@spawnat (p + (subsize >> 1)) myindexes(s))[1]
+      iStop = indexesStop[numel(indexesStop)]
+      return (iStart:iStop)
+   end
+end
+
+# Returns a list of processors that will contain data, given the DArray is
+# redistributed for the black box algorithm
+function redistbb_procs(np, l)
+   numprocs = np >> 1
+   size = 2^l
+   list = zeros(Int64, numprocs)
+   for p = 1 : numprocs
+      list[p] = (p - 1) * size + 1
+   end
+   return list
+end
+
+# Redistribute the darray s by moving data in the pattern needed for black box algorithm
+# Returns a new darray
+function redistbb(s, l)
+   np = numel(procs(s))
+   return darray((T,lsz,da)->s[redistbb_localValues(s,l)], eltype(s),
+                 size(s), distdim(s), redistbb_procs(np, l), redistbb_localIndexes(s,np,l))
+end
+
+
+############################################################################################################
+################################## Different implementations of Bit-Reversal ###############################
+
+# Bit reversal lookup table for all values up to a Byte
+BRLT256 =
+[
+         0x00, 0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10, 0x90, 0x50, 0xD0, 0x30, 0xB0, 0x70, 0xF0,
+         0x08, 0x88, 0x48, 0xC8, 0x28, 0xA8, 0x68, 0xE8, 0x18, 0x98, 0x58, 0xD8, 0x38, 0xB8, 0x78, 0xF8,
+         0x04, 0x84, 0x44, 0xC4, 0x24, 0xA4, 0x64, 0xE4, 0x14, 0x94, 0x54, 0xD4, 0x34, 0xB4, 0x74, 0xF4,
+         0x0C, 0x8C, 0x4C, 0xCC, 0x2C, 0xAC, 0x6C, 0xEC, 0x1C, 0x9C, 0x5C, 0xDC, 0x3C, 0xBC, 0x7C, 0xFC,
+         0x02, 0x82, 0x42, 0xC2, 0x22, 0xA2, 0x62, 0xE2, 0x12, 0x92, 0x52, 0xD2, 0x32, 0xB2, 0x72, 0xF2,
+         0x0A, 0x8A, 0x4A, 0xCA, 0x2A, 0xAA, 0x6A, 0xEA, 0x1A, 0x9A, 0x5A, 0xDA, 0x3A, 0xBA, 0x7A, 0xFA,
+         0x06, 0x86, 0x46, 0xC6, 0x26, 0xA6, 0x66, 0xE6, 0x16, 0x96, 0x56, 0xD6, 0x36, 0xB6, 0x76, 0xF6,
+         0x0E, 0x8E, 0x4E, 0xCE, 0x2E, 0xAE, 0x6E, 0xEE, 0x1E, 0x9E, 0x5E, 0xDE, 0x3E, 0xBE, 0x7E, 0xFE,
+         0x01, 0x81, 0x41, 0xC1, 0x21, 0xA1, 0x61, 0xE1, 0x11, 0x91, 0x51, 0xD1, 0x31, 0xB1, 0x71, 0xF1,
+         0x09, 0x89, 0x49, 0xC9, 0x29, 0xA9, 0x69, 0xE9, 0x19, 0x99, 0x59, 0xD9, 0x39, 0xB9, 0x79, 0xF9,
+         0x05, 0x85, 0x45, 0xC5, 0x25, 0xA5, 0x65, 0xE5, 0x15, 0x95, 0x55, 0xD5, 0x35, 0xB5, 0x75, 0xF5,
+         0x0D, 0x8D, 0x4D, 0xCD, 0x2D, 0xAD, 0x6D, 0xED, 0x1D, 0x9D, 0x5D, 0xDD, 0x3D, 0xBD, 0x7D, 0xFD,
+         0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3, 0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3,
+         0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB, 0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB,
+         0x07, 0x87, 0x47, 0xC7, 0x27, 0xA7, 0x67, 0xE7, 0x17, 0x97, 0x57, 0xD7, 0x37, 0xB7, 0x77, 0xF7,
+         0x0F, 0x8F, 0x4F, 0xCF, 0x2F, 0xAF, 0x6F, 0xEF, 0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF
+]
+
+# Reverse bits for an n-bit number, with n being at most 32,
+# using lookup table
+function bitr_lookup(i, n)
+   bitReversed = (BRLT256[(i & 0xff) + 1] << 24) |
+                 (BRLT256[((i >> 8) & 0xff) + 1] << 16) |
+                 (BRLT256[((i >> 16) & 0xff) + 1] << 8) |
+                 (BRLT256[((i >> 24) & 0xff) + 1])
+   bitReversed = bitReversed >> (32 - n)
+   return bitReversed
+end
+
+# Bit-Reversal using normal loop and bit shifts
+# for a number i that is represented with n bits
+function bitr_loop(i, n)
+   bitReversed = 0
+   bitShifted = 0
+
+   while (i >= 1 || bitShifted < n)
+      bitReversed = (bitReversed << 1) + (i & 1)
+      i = i >> 1
+      bitShifted += 1
+   end
+
+   return bitReversed
+end
+
+# Bit-Reverse an array of numbers
+function bitr(array)
+   n = numel(array)
+   numbits = convert(Int32, ceil(log(n)/log(2)));
+   for i=0:n-1
+      bitReversed = bitr_loop(i, numbits)
+      #bitReversed = bitr_lookup(i, numbits)
+
+      if (i < bitReversed && bitReversed < n)
+         temp = array[i+1]
+         array[i+1] = array[bitReversed+1]
+         array[bitReversed+1] = temp
+      end
+   end
+   return array
+end
+
+############################################################################################################
+############################### Different implementations of FFT and parallel FFT ##########################
+
+function fft_dit_in_place(array, top::Int64, bot::Int64)
+   if (bot > top)
+      half::Int64 = floor((bot + top) / 2)
+
+      fft_dit_in_place(array, top, half)
+      fft_dit_in_place(array, half + 1, bot)
+
+      n::Int64 = bot - top + 1
+      subsize::Int64 = floor(n/2)
+
+      for k = 0 : half - top
+         upper::Int64 = top + k
+         lower::Int64 = upper + subsize
+
+         upperVal = array[upper + 1] # make sure to increment 1 since Julia is 1-based
+         lowerVal = exp(im * (-2 * pi * k / n)) * array[lower + 1]
+
+         array[upper + 1] = upperVal + lowerVal
+         array[lower + 1] = upperVal - lowerVal
+      end
+   end
+end
+
+# In place FFT computation, modifies the distributed array
+# Random spawning #
+function fftp_dit_darray_random_spawn(array::DArray, startIdx, endIdx)
+   if (endIdx > startIdx)
+      half = int64(floor((startIdx + endIdx) / 2))
+
+      @sync begin
+         @spawn fftp_dit_darray_random_spawn(array, startIdx, half)
+         @spawn fftp_dit_darray_random_spawn(array, half + 1, endIdx)
+      end
+
+      n = endIdx - startIdx + 1
+
+      for k = 0 : half - startIdx
+         top = startIdx + k
+         bot = top + int64(n / 2)
+
+         topValue = array[top + 1]
+         botValue = exp(im * (-2 *pi * k / n)) * array[bot + 1]
+
+         array[top + 1] = topValue + botValue
+         array[bot + 1] = topValue - botValue
+      end
+   end
+end
+
+# In place FFT computation, modifies the distributed array
+# Smart spawning to make sure processors with local data are used most#
+function fftp_dit_darray_smart_spawn(array::DArray, startIdx, endIdx)
+   if (endIdx > startIdx)
+      half = int64(floor((startIdx + endIdx) / 2))
+
+      #Find the local processor of the first piece of data
+      pTop = owner(array, startIdx)
+
+      #Find the local processor of the second piece of data
+      pBot = owner(array, half + 1)
+
+      @sync begin
+            @spawnat pTop fftp_dit_darray_smart_spawn(array, startIdx, half)
+            @spawnat pBot fftp_dit_darray_smart_spawn(array, half + 1, endIdx)
+      end
+
+      #if (pTop != pBot) #If the data is not yet local, bring them together before doing computations
+         #array = redist(array, pTop, pBot)
+      #end
+
+      n = endIdx - startIdx + 1
+
+
+      for k = 0 : half - startIdx
+         top = startIdx + k
+         bot = top + int64(floor(n/2))
+
+         topValue = array[top]
+         botValue = exp(im * (-2 *pi * k / n)) * array[bot]
+
+         array[top] = topValue + botValue
+         array[bot] = topValue - botValue
+      end
+
+   end
+end
+
+function fft(array::DArray)
+   localIndexes = myindexes(array)[1]
+   localArray = array[localIndexes]
+   fft_dit_in_place(localArray, 0, numel(localArray)-1)
+   array[localIndexes] = localArray
+end
+
+function fftp_combine(array::DArray)
+   localIndexes = myindexes(array)[1]
+   n = numel(localIndexes)
+   startIdx = localIndexes[1]
+   endIdx = localIndexes[n]
+   half = int64(floor((startIdx + endIdx) / 2))
+
+   subsize = int64(floor(n/2))
+   for k = 0 : half - startIdx
+      top = startIdx + k
+      bot = top + subsize
+
+      topValue = array[top]
+      botValue = exp(im * (-2 *pi * k / n)) * array[bot]
+
+      array[top] = topValue + botValue
+      array[bot] = topValue - botValue
+   end
+end
+
+function fftp_dit_darray_fftw(array::DArray)
+   procDist = procs(array)
+   np = numel(procDist)
+
+   @sync begin
+      for p = 1 : np
+         @spawnat p fft(array)
+      end
+   end
+
+   logp = int32(log(np) / log(2))
+
+   for stage = 1 : logp
+      array = redistbb(array, stage)
+      numCombs = np >> stage
+      subsize = 2^stage
+
+      @sync begin
+         for i = 1 : numCombs
+            @spawnat ((i - 1) * subsize + 1) fftp_combine(array)
+         end
+      end
+   end
+
+   return array
+end
+
+# Only communicate version
+function fft_oc(array::DArray)
+   #localIndexes = myindexes(array)[1]
+   #localArray = array[localIndexes]
+   #array[localIndexes] = localArray
+end
+
+# Only communicate version
+function fftp_combine_oc(array::DArray)
+   #localIndexes = myindexes(array)[1]
+end
+
+# Only communicate version
+function fftp_dit_darray_fftw_oc(array::DArray)
+   procDist = procs(array)
+   np = numel(procDist)
+
+   @sync begin
+      for p = 1 : np
+         @spawnat p fft_oc(array)
+      end
+   end
+
+   logp = int32(log(np) / log(2))
+
+   for stage = 1 : logp
+      array = redistbb(array, stage)
+      numCombs = np >> stage
+      subsize = 2^stage
+
+      @sync begin
+         for i = 1 : numCombs
+            @spawnat ((i - 1) * subsize + 1) fftp_combine_oc(array)
+         end
+      end
+   end
+
+   return array
+end
+
+# Entry point to compute the parallel FFT
+function fftp(array)
+   n = numel(array)
+   if ((n & (n-1)) == 0)
+      bitr(array)
+      darr = distribute(array)
+      return fftp_dit_darray_fftw(darr)
+   else
+      fft(array)
+   end
+end
+
+# Only communicate version of fftp, no actual computation is done
+# This is mainly used for measuring the latency cost of transferring data between nodes in FFT
+function fftp_oc(array)
+   n = numel(array)
+   if ((n & (n-1)) == 0)
+      darr = distribute(array)
+      return fftp_dit_darray_fftw_oc(darr)
+   end
+end
